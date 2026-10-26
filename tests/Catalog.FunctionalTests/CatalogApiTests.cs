@@ -504,4 +504,167 @@ public sealed class CatalogApiTests : IClassFixture<CatalogApiFixture>
         Assert.Empty(result!.Data);
         Assert.Equal(1000, result.PageIndex);
     }
+
+    private static CatalogItem CreateInStockTestItem(int id, string name, int availableStock, int catalogTypeId = 8, int catalogBrandId = 13) =>
+        new(name)
+        {
+            Id = id,
+            Description = "In-stock filter test item",
+            Price = 10.00m,
+            PictureFileName = null,
+            CatalogTypeId = catalogTypeId,
+            CatalogType = null,
+            CatalogBrandId = catalogBrandId,
+            CatalogBrand = null,
+            AvailableStock = availableStock,
+            RestockThreshold = 10,
+            MaxStockThreshold = 200,
+            OnReorder = false
+        };
+
+    private static async Task CreateInStockTestItemAsync(HttpClient httpClient, CatalogItem item)
+    {
+        var response = await httpClient.PostAsJsonAsync("/api/catalog/items", item, TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    private async Task<PaginatedItems<CatalogItem>> GetPaginatedItemsAsync(HttpClient httpClient, string requestUri)
+    {
+        var response = await httpClient.GetAsync(requestUri, TestContext.Current.CancellationToken);
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+
+        return JsonSerializer.Deserialize<PaginatedItems<CatalogItem>>(body, _jsonSerializerOptions);
+    }
+
+    private async Task DeleteCatalogItemsAsync(HttpClient httpClient, params int[] ids)
+    {
+        foreach (var id in ids)
+        {
+            await httpClient.DeleteAsync($"/api/catalog/items/{id}", TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task GetCatalogItemsWithoutInStockParameterMatchesExplicitFalse()
+    {
+        var httpClient = CreateHttpClient(new ApiVersion(2.0));
+
+        var baseline = await GetPaginatedItemsAsync(httpClient, "/api/catalog/items?pageIndex=0&pageSize=5");
+        var explicitFalse = await GetPaginatedItemsAsync(httpClient, "/api/catalog/items?pageIndex=0&pageSize=5&inStock=false");
+
+        // Omitting the parameter (and passing false) must not change items, order or paging metadata.
+        Assert.Equal(baseline.Count, explicitFalse.Count);
+        Assert.Equal(baseline.PageIndex, explicitFalse.PageIndex);
+        Assert.Equal(baseline.PageSize, explicitFalse.PageSize);
+        Assert.Equal(baseline.Data.Select(i => i.Id), explicitFalse.Data.Select(i => i.Id));
+    }
+
+    [Fact]
+    public async Task GetCatalogItemsInStockTrueExcludesOutOfStockItems()
+    {
+        var httpClient = CreateHttpClient(new ApiVersion(2.0));
+        const string prefix = "US144Stock";
+        const int inStockId = 20001;
+        const int outOfStockId = 20002;
+
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(inStockId, $"{prefix} In Stock", 25));
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(outOfStockId, $"{prefix} Out Of Stock", 0));
+
+        try
+        {
+            var unfiltered = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&pageIndex=0&pageSize=10");
+            Assert.Equal(2, unfiltered.Count);
+
+            var filtered = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&pageIndex=0&pageSize=10&inStock=true");
+
+            Assert.Equal(1, filtered.Count);
+            var item = Assert.Single(filtered.Data);
+            Assert.Equal(inStockId, item.Id);
+            Assert.True(item.AvailableStock > 0);
+        }
+        finally
+        {
+            await DeleteCatalogItemsAsync(httpClient, inStockId, outOfStockId);
+        }
+    }
+
+    [Fact]
+    public async Task GetCatalogItemsInStockTrueWithPagingReflectsFilteredSet()
+    {
+        var httpClient = CreateHttpClient(new ApiVersion(2.0));
+        const string prefix = "US144Paging";
+        int[] ids = [20003, 20004, 20005, 20006, 20007];
+
+        // Three items in stock (A, C, E) and two out of stock (B, D); results sort by name.
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(20003, $"{prefix} A", 1));
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(20004, $"{prefix} B", 0));
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(20005, $"{prefix} C", 2));
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(20006, $"{prefix} D", 0));
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(20007, $"{prefix} E", 3));
+
+        try
+        {
+            var page0 = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&pageIndex=0&pageSize=2&inStock=true");
+            var page1 = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&pageIndex=1&pageSize=2&inStock=true");
+            var page2 = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&pageIndex=2&pageSize=2&inStock=true");
+
+            // Paging metadata reflects the filtered set of 3 in-stock items, never the unfiltered set of 5.
+            Assert.Equal(3, page0.Count);
+            Assert.Equal(3, page1.Count);
+
+            // The middle page is never short or empty because filtering happens in the query, not post-paging.
+            var page0Ids = page0.Data.Select(i => i.Id).ToList();
+            Assert.Equal([20003, 20005], page0Ids);
+            Assert.Equal([20007], page1.Data.Select(i => i.Id));
+            Assert.Empty(page2.Data);
+            Assert.All(page0.Data.Concat(page1.Data), item => Assert.True(item.AvailableStock > 0));
+        }
+        finally
+        {
+            await DeleteCatalogItemsAsync(httpClient, ids);
+        }
+    }
+
+    [Fact]
+    public async Task GetCatalogItemsInStockTrueCombinesWithOtherFilters()
+    {
+        var httpClient = CreateHttpClient(new ApiVersion(2.0));
+        const string prefix = "US144Combo";
+        const int inStockId = 20008;
+        const int outOfStockId = 20009;
+
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(inStockId, $"{prefix} In Stock", 5));
+        await CreateInStockTestItemAsync(httpClient, CreateInStockTestItem(outOfStockId, $"{prefix} Out Of Stock", 0));
+
+        try
+        {
+            // Intersection of name + type + brand + inStock.
+            var matching = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&type=8&brand=13&pageIndex=0&pageSize=10&inStock=true");
+            Assert.Equal(1, matching.Count);
+            var item = Assert.Single(matching.Data);
+            Assert.Equal(inStockId, item.Id);
+            Assert.Equal(8, item.CatalogTypeId);
+            Assert.Equal(13, item.CatalogBrandId);
+
+            // A non-matching type narrows the intersection to empty, even with inStock=true.
+            var nonMatchingType = await GetPaginatedItemsAsync(httpClient, $"/api/catalog/items?name={prefix}&type=7&pageIndex=0&pageSize=10&inStock=true");
+            Assert.Equal(0, nonMatchingType.Count);
+            Assert.Empty(nonMatchingType.Data);
+        }
+        finally
+        {
+            await DeleteCatalogItemsAsync(httpClient, inStockId, outOfStockId);
+        }
+    }
+
+    [Fact]
+    public async Task GetCatalogItemsWithInvalidInStockReturnsBadRequest()
+    {
+        var httpClient = CreateHttpClient(new ApiVersion(2.0));
+
+        var response = await httpClient.GetAsync("/api/catalog/items?inStock=abc", TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
 }
