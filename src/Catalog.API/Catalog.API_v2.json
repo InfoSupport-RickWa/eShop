@@ -637,6 +637,15 @@
             }
           },
           {
+            "name": "inStock",
+            "in": "query",
+            "description": "When true, only return items that are in stock (available stock greater than zero)",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
             "name": "api-version",
             "in": "query",
             "description": "The API version, in the format 'major.minor'.",

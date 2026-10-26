@@ -133,7 +133,8 @@ public static class CatalogApi
         [AsParameters] CatalogServices services,
         [Description("The name of the item to return")] string? name,
         [Description("The types of items to return. Repeat the parameter to filter by multiple types.")] int[]? type,
-        [Description("The brands of items to return. Repeat the parameter to filter by multiple brands.")] int[]? brand)
+        [Description("The brands of items to return. Repeat the parameter to filter by multiple brands.")] int[]? brand,
+        [Description("When true, only return items that are in stock (available stock greater than zero)")] bool inStock = false)
     {
         var pageSize = paginationRequest.PageSize;
         var pageIndex = paginationRequest.PageIndex;
@@ -151,6 +152,10 @@ public static class CatalogApi
         if (brand is { Length: > 0 })
         {
             root = root.Where(c => brand.Contains(c.CatalogBrandId));
+        }
+        if (inStock)
+        {
+            root = root.Where(c => c.AvailableStock > 0);
         }
 
         var totalItems = await root
